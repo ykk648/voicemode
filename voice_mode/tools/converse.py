@@ -1588,7 +1588,8 @@ consult the MCP resources listed above.
                     bridge_speak_sent = False
                     try:
                         import json as _json
-                        async with httpx.AsyncClient(timeout=3.0) as _client:
+                        # Bridge 同步阻塞到数字人讲完才返回 200，所以 timeout 必须 >= 最长一句的播放时长
+                        async with httpx.AsyncClient(timeout=120.0) as _client:
                             _resp = await _client.post(
                                 bridge_speak_url,
                                 json={"text": message, "voice": voice if voice else "zf_001"},
