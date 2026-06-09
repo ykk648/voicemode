@@ -1579,15 +1579,43 @@ consult the MCP resources listed above.
                 # Speak the message
                 tts_start = time.perf_counter()
                 if should_skip_tts:
-                    # Skip TTS entirely for faster response
-                    tts_success = True
+                    # Skip TTS locally — send text to desktop digital human bridge server
+                    # so it handles TTS + lip-sync animation + playback.
+                    bridge_speak_url = os.environ.get(
+                        "VOICEMODE_BRIDGE_SPEAK_URL",
+                        "http://127.0.0.1:18880/speak",
+                    )
+                    bridge_speak_sent = False
+                    try:
+                        import json as _json
+                        async with httpx.AsyncClient(timeout=3.0) as _client:
+                            _resp = await _client.post(
+                                bridge_speak_url,
+                                json={"text": message, "voice": voice if voice else "zf_001"},
+                            )
+                            _resp.raise_for_status()
+                        bridge_speak_sent = True
+                        logger.info(
+                            f"Bridge speak sent to {bridge_speak_url}: "
+                            f"'{message[:80]}{'...' if len(message) > 80 else ''}'"
+                        )
+                    except Exception as _exc:
+                        logger.warning(
+                            f"Bridge server not available at {bridge_speak_url}: {_exc}"
+                        )
+                    tts_success = bridge_speak_sent
                     tts_metrics = {
                         'ttfa': 0,
                         'generation': 0,
                         'playback': 0,
-                        'total': 0
+                        'total': 0,
                     }
-                    tts_config = {'provider': 'no-op', 'voice': 'none'}
+                    if bridge_speak_sent:
+                        tts_metrics['bridge_url'] = bridge_speak_url
+                    tts_config = {
+                        'provider': 'bridge-server',
+                        'voice': voice if voice else 'zf_001',
+                    }
                 else:
                     # Duck DJ volume during TTS playback
                     with DJDucker():
@@ -1646,8 +1674,24 @@ consult the MCP resources listed above.
                         logger.error(f"Failed to log TTS to JSONL: {e}")
                 
                 if not tts_success:
+                    # Check if this was a bridge-server attempt (skip_tts mode)
+                    if tts_config and tts_config.get('provider') == 'bridge-server':
+                        # Bridge server is the external TTS/playback path — when it's
+                        # unavailable the message is NOT spoken, but this is not a
+                        # local TTS provider failure. Report clearly so the caller
+                        # doesn't try to restart Kokoro or troubleshoot TTS.
+                        import os as _os
+                        bridge_url = _os.environ.get(
+                            "VOICEMODE_BRIDGE_SPEAK_URL",
+                            "http://127.0.0.1:18880/speak",
+                        )
+                        result = (
+                            "Error: Could not speak message. "
+                            "Bridge server not available at " + bridge_url + ". "
+                            "Check that the bridge service is running."
+                        )
                     # Check if we have detailed error information
-                    if tts_config and tts_config.get('error_type') == 'all_providers_failed':
+                    elif tts_config and tts_config.get('error_type') == 'all_providers_failed':
                         error_lines = ["Error: Could not speak message. TTS service connection failed:"]
                         openai_error_shown = False
 
