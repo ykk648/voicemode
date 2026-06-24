@@ -152,7 +152,9 @@ def load_voicemode_env():
 # Example: VOICEMODE_STT_PROMPT=tmux, Tali, kubectl, VoiceMode
 # VOICEMODE_STT_PROMPT=
 
-# Comma-separated list of preferred voices
+# Comma-separated list of preferred voices (local-only by default)
+VOICEMODE_VOICES=af_sky
+# To use OpenAI voices, set OPENAI_API_KEY and add them here:
 # VOICEMODE_VOICES=af_sky,alloy
 
 # Comma-separated list of preferred models
@@ -578,8 +580,13 @@ AUTO_START_KOKORO = os.getenv("VOICEMODE_AUTO_START_KOKORO", "").lower() in ("tr
 # Enable/disable the conch system entirely
 CONCH_ENABLED = os.getenv("VOICEMODE_CONCH_ENABLED", "true").lower() in ("true", "1", "yes", "on")
 
-# Maximum time (seconds) to wait for conch when wait_for_conch=true
-CONCH_TIMEOUT = float(os.getenv("VOICEMODE_CONCH_TIMEOUT", "60"))
+# Maximum time (seconds) a queued caller waits for the conch when
+# wait_for_conch=true. Should be generous enough to outlast a held floor's
+# between-turn gaps, but no longer than your harness's MCP tool-call timeout
+# (a longer wait would just be killed by the client). A waiter also fast-fails
+# the instant the holder's PID dies, so this is an upper bound, not a fixed
+# delay. Overridable per call by passing a number of seconds to wait_for_conch.
+CONCH_TIMEOUT = float(os.getenv("VOICEMODE_CONCH_TIMEOUT", "300"))
 
 # How often (seconds) to check if conch is free when waiting
 CONCH_CHECK_INTERVAL = float(os.getenv("VOICEMODE_CONCH_CHECK_INTERVAL", "0.5"))
@@ -590,6 +597,46 @@ CONCH_CHECK_INTERVAL = float(os.getenv("VOICEMODE_CONCH_CHECK_INTERVAL", "0.5"))
 # Default 300s (5 min) covers 2 min listen + long TTS. Set to 0 to disable.
 CONCH_LOCK_EXPIRY = float(os.getenv("VOICEMODE_CONCH_LOCK_EXPIRY", "300"))
 
+# Maximum idle age (seconds) before a between-turns HOLD (hold_conch=true) is
+# considered stale and can be taken by another agent. A hold is a SHORT,
+# converse-refreshed TTL: every converse(hold_conch=true) re-stamps it, so this
+# only has to cover the gap between two turns (the holder thinking / light tool
+# use). Stop conversing and within this window the hold lapses and the queue
+# promotes the next waiter — no 30-minute wedge (VM-1649). Default 10s; tune
+# toward 5s once the short window proves comfortable. Overridable per call via
+# converse(conch_hold_timeout=...). Dead holders are cleared immediately via the
+# PID check regardless. Set to 0 to disable idle-expiry (dead-holder clearance
+# still applies).
+CONCH_HOLD_EXPIRY = float(os.getenv("VOICEMODE_CONCH_HOLD_EXPIRY", "10"))
+
+# Default delivery mode when a busy converse() engages the waiter queue (i.e.
+# wait_for_conch is truthy — that flag remains the gate for whether we queue at
+# all). VM-1415's "configurable default mode":
+#   "wait"     — block until the conch is granted to us, bounded by the timeout.
+#   "callback" — register and return immediately with the queue position; the
+#                turn is delivered out-of-band later (delivery is VM-1625).
+# Overridable per call via converse(conch_mode=...). Unknown values fall back to
+# "wait" so a misconfiguration never silently downgrades a wait into a callback.
+CONCH_MODE = os.getenv("VOICEMODE_CONCH_MODE", "wait").strip().lower()
+if CONCH_MODE not in ("wait", "callback"):
+    CONCH_MODE = "wait"
+
+# Heartbeat TTL (seconds) for a REMOTE waiter registered via the MCP `conch`
+# tool (VM-1622). A streamable-HTTP agent has no host PID, so its liveness is
+# the `expires` TTL on its queue entry (VM-1613's WaiterEntry.expires, honoured
+# by ConchQueue._is_live): the MCP front end stamps expires = now + TTL on every
+# wait/callback/heartbeat call, and an entry past its expires is pruned so the
+# queue never wedges on a dead remote waiter. 90s tolerates a couple of missed
+# ~30s beats yet prunes a genuinely-dead remote waiter within ~1.5 min.
+CONCH_REMOTE_TTL = float(os.getenv("VOICEMODE_CONCH_REMOTE_TTL", "90"))
+
+# Hard cap (seconds) on a blocking `conch(action="wait")` MCP call (VM-1622). A
+# blocking await-turn can exceed a streamable-HTTP client's request timeout, so
+# MCP defaults to register-and-return (callback); `wait` is still offered but
+# bounded by this cap (and by any smaller per-call timeout) well under typical
+# client timeouts. On timeout the waiter is deregistered cleanly.
+CONCH_MCP_WAIT_CAP = float(os.getenv("VOICEMODE_CONCH_MCP_WAIT_CAP", "25"))
+
 # Auto-focus tmux pane when conch is acquired (for multi-agent setups)
 # When enabled, automatically switches tmux focus to the speaking agent's pane
 AUTO_FOCUS_PANE = env_bool("VOICEMODE_AUTO_FOCUS_PANE", False)
@@ -598,6 +645,12 @@ AUTO_FOCUS_PANE = env_bool("VOICEMODE_AUTO_FOCUS_PANE", False)
 
 # OpenAI configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# Cartesia configuration (https://cartesia.ai)
+CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY")
+CARTESIA_VOICE_ID = os.getenv("VOICEMODE_CARTESIA_VOICE_ID", "")
+CARTESIA_MODEL = os.getenv("VOICEMODE_CARTESIA_MODEL", "sonic-3")
+CARTESIA_FALLBACK_MODEL = os.getenv("VOICEMODE_CARTESIA_FALLBACK_MODEL", "sonic-2")
 
 # Helper function to parse comma-separated lists
 def parse_comma_list(env_var: str, fallback: str) -> list:
@@ -1316,6 +1369,11 @@ def get_provider_supported_formats(provider: str, operation: str = "tts") -> lis
         "kokoro": {
             "tts": ["mp3", "opus", "flac", "wav", "pcm"],  # AAC is not currently supported
             "stt": []  # Kokoro is TTS only
+        },
+        "cartesia": {
+            # Cartesia streaming emits raw PCM; buffered /tts/bytes returns WAV.
+            "tts": ["pcm", "wav"],
+            "stt": []
         },
         # STT providers
         "whisper-local": {

@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [8.9.0] - 2026-06-24
+
+### Added
+
+- **A minimal voice-only example agent (VM-1658)** — The voicemode plugin now ships a `voice-only` subagent whose *only* tool is `converse` — no file access, shell, or editing, by design. It's the smallest thing that can hold a spoken conversation, so it starts with a tiny context footprint, and works whether voicemode is provided by the plugin or by a project `.mcp.json` (both `converse` tool names are whitelisted). Launch it for a quick voice-only chat, or copy it as a template for your own lean voice agents.
+
+## [8.8.0] - 2026-06-23
+
+### Added
+
+#### Conch — coordinate the voice channel across multiple agents (epic VM-1610)
+
+The conch is VoiceMode's single-speaker lock. This release turns it into a full multi-agent coordination layer — hold the floor, queue for it, hand it off, and watch it from the CLI or MCP.
+
+- **Hold the floor across turns** — `hold_conch=true` on `converse` keeps the channel between turns so a second agent can't cut in mid-thought; `pause_conversation` holds it across a deliberate pause. Opt-in, and released on your next turn, on process exit, or after a short idle timeout. (VM-1433)
+- **Ordered waiter queue** — when the conch is busy, `converse` joins a fair FIFO queue instead of racing for it: choose `wait` (block until it's yours) or `callback` (return now, get pinged when granted). (VM-1619)
+- **Notify-on-give** — an agent handed the floor while it's idle gets a "your turn" nudge in its pane instead of missing its turn. (VM-1625)
+- **`voicemode conch` CLI** — `status`, `give`, `bump`, `release`, and `wait` to observe and drive the queue from the command line. (VM-1616)
+- **MCP parity for remote agents** — a new `conch` MCP tool gives streamable-HTTP agents the same queue control as the CLI, over the same shared state. (VM-1622)
+- **`conch give` can summon any running session** — hand the floor to an agent that isn't in line yet, not just one already waiting. (VM-1637)
+- **Idle holds expire fast** — a held conch now lapses on a short, refreshed timeout (default 10s) so a quiet agent can't wedge the channel for everyone. (VM-1649)
+- **Fair promotion** — the queue skips idle callback-waiters to promote the next agent actually blocking on the floor, so nobody starves behind an idle one. (VM-1625)
+
+#### Other
+
+- **Cartesia as a first-class cloud TTS provider with sub-second streaming ([#368](https://github.com/mbailey/voicemode/pull/368))** — Adds Cartesia alongside OpenAI and Kokoro, with low-latency SSE PCM streaming (audio starts playing within a few hundred milliseconds) and a buffered WAV fallback, plus automatic primary→fallback model retry. It's auto-detected: add an `api.cartesia.ai` entry to `VOICEMODE_TTS_BASE_URLS` and set `CARTESIA_API_KEY` (with optional `VOICEMODE_CARTESIA_VOICE_ID` / `VOICEMODE_CARTESIA_MODEL` / `VOICEMODE_CARTESIA_FALLBACK_MODEL`). When Cartesia isn't configured the TTS path is unchanged. Contributed by [@Sallvainian](https://github.com/Sallvainian).
+- **NixOS: build whisper.cpp (with CUDA) via a Nix flake, and clearer NixOS install guidance ([#319](https://github.com/mbailey/voicemode/pull/319))** — Nix flake outputs build whisper.cpp from source (CPU + CUDA) with a `voice-mode-cuda` wrapper, and the whisper/kokoro install tools now detect NixOS and give actionable setup guidance instead of a cryptic FHS build failure. Contributed by [@KaiStarkk](https://github.com/KaiStarkk).
+- **`converse --voice` now accepts relative and `~` paths to a reference clip (VM-1607)** — `--voice ./clip.wav`, `../clip.wav`, and `~/clip.wav` now work, not just absolute paths, and pick up a sidecar `<basename>.txt` transcript the same way.
+- **Voice personas are now discoverable by agents (VM-1580)** — The `converse` tool and the `converse` / `voicemode` skills now point agents at a voice's persona file (`~/.voicemode/voices/<name>/README.md`), so an agent picking a voice can read *who it is and how it should behave*, not just its name.
+
+### Fixed
+
+- **Clearer guidance when the CUDA toolkit is missing during a GPU whisper install ([#250](https://github.com/mbailey/voicemode/pull/250), fixes #249)** — A GPU-enabled whisper.cpp install on Linux without `nvcc` now detects the distro (apt vs dnf) and suggests the correct package-install command plus a `--no-gpu` CPU-only alternative, instead of a confusing build error. Contributed by [@htrex](https://github.com/htrex).
+- **Pin the mlx-audio install spec to `>=0.4.3,<0.4.4` to block the broken 0.4.4 release (VM-1550, VM-1547)** — mlx-audio 0.4.4 regressed the Kokoro TTS decoder: `istftnet.py` SineGen crashes with a `[broadcast_shapes]` `ValueError` on longer utterances and returns HTTP 500. With mlx-audio as the primary TTS endpoint, voicemode's failover then masks this as a spurious "OpenAI API key is not set" error, producing intermittent, confusing converse failures. `voicemode service install mlx-audio` now caps below 0.4.4 (resolving to the crash-free 0.4.3) until a fixed upstream release ships. Existing installs on 0.4.4 should reinstall: `uv tool uninstall mlx-audio` then `voicemode service install mlx-audio` (or `uv tool install "mlx-audio==0.4.3" --force` with the server extras).
+- **Freshly cloned voices no longer fail to synthesize with empty reference text (VM-1439)** — `clone add` saved the reference transcript where the loader didn't look, so a just-cloned voice synthesized with no reference text and failed. The loader now also reads it from `voice.md`, repairing existing cloned voices automatically.
+- **`config set` no longer reports "updated" when nothing changed (VM-1628)** — Setting a key to the value it already had still rewrote `voicemode.env` and said `✅ updated successfully`. It now detects the no-op and reports `✓ already set to this value — no change`. Fixes the CLI, the MCP tool, and the installer.
+- **The default `voicemode.env` no longer silently falls back to OpenAI (VM-1556)** — The generated default left the voice list commented out, so a hidden default (`af_sky,alloy`) put the OpenAI voice `alloy` in play — failing for users with local voices but no OpenAI key. It now ships local-only (`VOICEMODE_VOICES=af_sky`), with an opt-in line for adding OpenAI voices.
+
+### Security
+
+- **Pin `urllib3` and `jaraco-context` to safe versions, clearing 5 runtime High CVEs (VM-1640)** — Dependency constraints now force patched `urllib3` and `jaraco-context` (plus an `openai>=2` floor), clearing four urllib3 and one jaraco-context high-severity advisories. osv-scanner now reports 0 Critical.
+
+## [8.7.1] - 2026-06-09
+
 ## [8.7.0] - 2026-06-09
 
 ### Security

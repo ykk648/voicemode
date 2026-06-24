@@ -17,6 +17,8 @@ Voice expression syntax (``voice="<expr>"`` at converse time):
 * ``samantha[2]``        — the third ``*.wav`` (SuperDirt-style indexing)
 * ``samantha/angry.wav`` — an explicit file inside the voice dir
 * ``/abs/path.wav``      — absolute path passed straight to the TTS server
+* ``./clip.wav``         — path relative to the CWD (also ``../`` and ``~/``);
+  expanded to an absolute path before it reaches the server
 
 Remote TTS servers (e.g. mlx-audio on ms2) need the ref_audio path that
 exists on *their* filesystem, not ours. Set ``VOICEMODE_REMOTE_VOICES_DIR``
@@ -31,6 +33,8 @@ import re
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+import yaml
 
 logger = logging.getLogger("voicemode")
 
@@ -118,7 +122,16 @@ def _resolve_default_wav(voice_dir: Path) -> Optional[Path]:
 def _resolve_transcript(wav_path: Path) -> str:
     """Read the matching transcript for a reference WAV.
 
-    Looks for ``<basename>.txt`` first, then ``default.txt`` as a fallback.
+    Resolution order:
+
+    1. ``<basename>.txt`` sidecar next to the WAV.
+    2. ``default.txt`` sidecar in the same directory.
+    3. the ``transcript`` field of a ``voice.md`` frontmatter in the same
+       directory — the layout ``voicemode clone add`` writes (VM-1439). This
+       lazily repairs voice.md-only profiles (those created before clone add
+       also wrote a ``default.txt``) so they resolve a non-empty ref_text with
+       no migration step.
+
     Returns empty string if no transcript is found (caller will warn).
     """
     same_name = wav_path.with_suffix(".txt")
@@ -129,7 +142,51 @@ def _resolve_transcript(wav_path: Path) -> str:
     if fallback.exists():
         return fallback.read_text().strip()
 
-    return ""
+    return _transcript_from_voice_md(wav_path.parent / "voice.md")
+
+
+def _extract_frontmatter(text: str) -> Optional[str]:
+    """Return the YAML frontmatter delimited by the first two ``---`` fences.
+
+    Returns ``None`` if ``text`` doesn't open with a ``---`` fence or the
+    closing fence is missing.
+    """
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return "\n".join(lines[1:i])
+    return None
+
+
+def _transcript_from_voice_md(voice_md: Path) -> str:
+    """Read the ``transcript`` field from a ``voice.md`` frontmatter.
+
+    ``voicemode clone add`` records the reference transcript in the voice.md
+    YAML frontmatter (``transcript:``). Reading it here lets the loader
+    resolve a non-empty ref_text for cloned voices that have no ``.txt``
+    sidecar. Returns empty string when the file is missing, has no
+    frontmatter, or has no usable ``transcript`` field.
+    """
+    if not voice_md.exists():
+        return ""
+    try:
+        front = _extract_frontmatter(voice_md.read_text())
+    except OSError:
+        return ""
+    if front is None:
+        return ""
+    try:
+        data = yaml.safe_load(front)
+    except yaml.YAMLError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    transcript = data.get("transcript")
+    if not isinstance(transcript, str):
+        return ""
+    return transcript.strip()
 
 
 def _read_description(voice_dir: Path) -> str:
@@ -256,8 +313,20 @@ def parse_voice_expr(expr: str) -> Tuple[Optional[str], Optional[str]]:
 
     Selector is either ``None`` (use default), a string like ``"[N]"``
     (indexed sample), or a relative file path inside the voice dir
-    (e.g. ``"angry.wav"``). For absolute paths the voice_name is ``None``
-    and the selector is the absolute path itself.
+    (e.g. ``"angry.wav"``). For a filesystem path the voice_name is
+    ``None`` and the selector is the path itself.
+
+    Filesystem paths are recognised when the expression starts with a
+    path marker — ``/`` (absolute), ``./`` or ``../`` (relative to the
+    CWD), or ``~`` (home). Relative and home forms are expanded and made
+    absolute against the CWD so the rest of the pipeline — and the TTS
+    server — always sees a concrete path. We use ``os.path.abspath``
+    (lexical) rather than ``Path.resolve()`` so a symlinked
+    ``default.wav`` is preserved: resolving the symlink would change
+    which sidecar transcript (``<basename>.txt``) we pick up.
+
+    A bare ``name/file.wav`` (no leading ``./``) stays the
+    profile-selector form, so the path markers don't collide with it.
 
     Examples::
 
@@ -265,11 +334,17 @@ def parse_voice_expr(expr: str) -> Tuple[Optional[str], Optional[str]]:
         parse_voice_expr("samantha[0]")        == ("samantha", "[0]")
         parse_voice_expr("samantha/angry.wav") == ("samantha", "angry.wav")
         parse_voice_expr("/abs/path.wav")      == (None, "/abs/path.wav")
+        parse_voice_expr("./clip.wav")         == (None, "/cwd/clip.wav")
+        parse_voice_expr("~/clip.wav")         == (None, "/home/clip.wav")
     """
     if not expr:
         return None, None
     if expr.startswith("/"):
         return None, expr
+    # Explicit-relative (./, ../) and home (~) paths → expand to an
+    # absolute path and hand off to the absolute-path escape hatch.
+    if expr.startswith(("./", "../", "~")):
+        return None, os.path.abspath(os.path.expanduser(expr))
 
     m = _INDEX_RE.match(expr)
     if m:

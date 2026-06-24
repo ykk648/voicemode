@@ -1,5 +1,5 @@
-site_name: Voice Mode
-site_url: https://voice-mode.readthedocs.io
+site_name: VoiceMode
+site_url: https://voicemode.dev
 site_description: Natural voice conversations for AI assistants
 site_author: Voice Mode Team
 
@@ -104,6 +104,7 @@ nav:
   - Development:
     - Local Development: tutorials/development-setup.md
     - Tool Loading Architecture: reference/tool-loading-architecture.md
+    - PR Review Rubric: maintainers/pr-review-rubric.md
   - Troubleshooting:
     - Overview: troubleshooting/index.md
 
@@ -113,8 +114,6 @@ extra:
       link: https://github.com/mbailey/voicemode
     - icon: fontawesome/brands/x-twitter
       link: https://twitter.com/getvoicemode
-    - icon: fontawesome/brands/discord
-      link: https://discord.gg/Hm7dF3uCfG
     - icon: fontawesome/brands/youtube
       link: https://youtube.com/@getvoicemode
 

@@ -25,7 +25,8 @@ except ImportError as e:
     VAD_AVAILABLE = False
 
 from voice_mode.server import mcp
-from voice_mode.conch import Conch
+from voice_mode.conch import Conch, _get_hold_expiry
+from voice_mode.conch_queue import ConchQueue
 from voice_mode.conversation_logger import get_conversation_logger
 from voice_mode.config import (
     audio_operation_lock,
@@ -66,6 +67,7 @@ from voice_mode.config import (
     CONCH_ENABLED,
     CONCH_TIMEOUT,
     CONCH_CHECK_INTERVAL,
+    CONCH_MODE,
     AUTO_FOCUS_PANE
 )
 import voice_mode.config
@@ -1272,11 +1274,17 @@ async def converse(
     chime_leading_silence: Optional[float] = None,
     chime_trailing_silence: Optional[float] = None,
     metrics_level: Optional[Literal["minimal", "summary", "verbose"]] = None,
-    wait_for_conch: Union[bool, str] = False,
+    wait_for_conch: Union[bool, str, int, float] = False,
+    conch_mode: Optional[Literal["wait", "callback"]] = None,
+    hold_conch: Union[bool, str] = False,
+    conch_hold_timeout: Optional[Union[float, str]] = None,
     skip_conch: Union[bool, str] = False,
+    session_id: Optional[str] = None,
     ref_text: Optional[str] = None,
 ) -> str:
     """Have an ongoing voice conversation - speak a message and optionally listen for response.
+
+Multi-agent turn-taking: if your next converse call will continue this thread (asking a question you'll answer, or speaking across several turns), pass hold_conch=true so other agents wait instead of cutting in at the turn boundary.
 
 <echo>Transcript visibility: print `> **ASSISTANT (voicemode):** <message>` before calling, and `> **USER (voicemode):** <reply>` after a spoken reply, so the conversation stays readable in the transcript. Skip if the user opted out of echo.</echo>
 
@@ -1303,6 +1311,9 @@ Example: If user says "search for tasks created yesterday", check for and invoke
    - voicemode://docs/troubleshooting - Audio, VAD, and connectivity issues
    - voice://voices - JSON list of available TTS voices
      (filter by provider with voice://voices/{provider}, e.g. voice://voices/kokoro)
+   - voice://voices/persona convention — a voice's character (who they are, how they
+     speak, sample lines) lives at ~/.voicemode/voices/<name>/README.md; read it before
+     speaking in-character (index: PERSONAS.md). MCP-resource version planned: VM-1222.
 
 KEY PARAMETERS:
 • message (required): The message to speak
@@ -1310,6 +1321,9 @@ KEY PARAMETERS:
 • voice (string): TTS voice name (auto-selected unless specified)
   - To list available voices, read MCP resource voice://voices
   - An absolute path to a .wav clones from that clip directly (no profile needed)
+  - The chosen voice is recorded in the conch, so in a multi-agent session you
+    can read another agent's voice (Conch.get_holder) and pick a different one
+    to avoid a voice clash.
 • ref_text (string): Reference transcript for clip-based cloning. A file path
   is read; anything else is the literal transcript. Overrides any sidecar.
   Only used with a clone voice (abs-path clip or registered profile).
@@ -1324,14 +1338,52 @@ KEY PARAMETERS:
   - minimal: Just response text (saves tokens)
   - summary: Response + compact timing (default)
   - verbose: Response + detailed metrics breakdown
-• wait_for_conch (bool, default: false): Multi-agent coordination
-  - false: If another agent is speaking, return status immediately
-  - true: Wait until the other agent finishes, then speak
+• wait_for_conch (bool|number, default: false): Multi-agent coordination — the
+  GATE for whether a busy conch puts you in the waiter queue at all.
+  - false: If another agent is speaking, return a status immediately WITHOUT
+    queuing (back-compat; you are never silently blocked). The status names the
+    holder and tells you how to queue.
+  - true: Join the FIFO waiter queue (you show up in `voicemode conch status`),
+    then behave per conch_mode (below). Fast-fails the moment the holder dies.
+  - a number: As true, but wait at most that many seconds, overriding the
+    configured default timeout for this call.
+• conch_mode ("wait"|"callback", default: VOICEMODE_CONCH_MODE, itself "wait"):
+  How a queued caller is served once wait_for_conch has engaged the queue. Has
+  NO effect unless wait_for_conch is truthy.
+  - wait: Block until the conch is granted to you (FIFO; the queue's grant hint
+    ensures only the next-in-line acquires — no thundering-herd steal), bounded
+    by the timeout. On timeout you are cleanly deregistered.
+  - callback: Register and return IMMEDIATELY with your queue position; your
+    message is NOT spoken now. When the conch is granted to you, your turn is
+    actively delivered out-of-band: a session nudge prompts you to call
+    converse() and take the floor (requires a session id; `voicemode conch
+    status` is always available as a supplementary view of your place in line).
+    You stay registered — that's the point.
+• hold_conch (bool, default: false): Keep the floor across turns (opt-in)
+  - WHEN: set true if your NEXT converse call will continue this thread —
+    you're asking a question you'll answer, or speaking over several turns —
+    so other agents queue instead of cutting in at the turn boundary. Leave
+    false (the default) for a one-off reply that ends the exchange.
+  - The hold is a SHORT, refreshed TTL: each converse(hold_conch=true)
+    re-stamps it to now + the hold timeout (default ~10s). Keep conversing
+    inside the window and the floor stays yours; stop and within the window
+    the hold lapses and the next queued agent is promoted — no stale wedge.
+    Released immediately by your next converse(hold_conch=false), your process
+    exiting, or idle-expiry. For a deliberate pause, use pause_conversation.
+• conch_hold_timeout (number, optional): Override the hold idle-expiry TTL for
+  THIS hold, in seconds (default: VOICEMODE_CONCH_HOLD_EXPIRY, ~10s). Only has
+  effect alongside hold_conch=true. The value is stamped into the conch lock so
+  OTHER agents honour your chosen window — raise it when you know the next turn
+  needs longer (heavy tool use between turns), lower it to release faster.
 • skip_conch (bool, default: false): Bypass conch entirely
   - false: Honour the conch lock (default multi-agent coordination)
   - true: Don't try to acquire or release the conch -- speak immediately
-    regardless of whether another agent holds it. Use when you intentionally
-    want to talk over other agents or run outside the coordination protocol.
+    regardless of whether another agent holds it (including a hold). Deliberate
+    escape hatch for overriding a stuck holder; not a fallback for a timeout.
+• session_id (string, optional): Caller-provided harness session ID, stored
+  verbatim in the conch lock so tooling can see which *session* holds the
+  floor. Falls back to VOICEMODE_SESSION_ID / CLAUDE_CODE_SESSION_ID from the
+  environment (stdio transport only) when not passed.
 
 TIMING PARAMETERS (usually leave at defaults):
   Silence detection handles most cases automatically. Only override these if
@@ -1373,10 +1425,79 @@ consult the MCP resources listed above.
         chime_enabled = chime_enabled.lower() in ('true', '1', 'yes', 'on')
     if skip_tts is not None and isinstance(skip_tts, str):
         skip_tts = skip_tts.lower() in ('true', '1', 'yes', 'on')
-    if isinstance(wait_for_conch, str):
-        wait_for_conch = wait_for_conch.lower() in ('true', '1', 'yes', 'on')
+    # wait_for_conch accepts bool | str | number. A positive number means
+    # "wait at most that many seconds" (and implies waiting); truthy strings
+    # use the configured default timeout.
+    conch_wait_timeout = CONCH_TIMEOUT
+    if isinstance(wait_for_conch, bool):
+        pass
+    elif isinstance(wait_for_conch, (int, float)):
+        conch_wait_timeout = float(wait_for_conch)
+        wait_for_conch = conch_wait_timeout > 0
+    elif isinstance(wait_for_conch, str):
+        s = wait_for_conch.strip().lower()
+        if s in ('true', '1', 'yes', 'on'):
+            wait_for_conch = True
+        elif s in ('false', '0', 'no', 'off', ''):
+            wait_for_conch = False
+        else:
+            try:
+                conch_wait_timeout = float(s)
+                wait_for_conch = conch_wait_timeout > 0
+            except ValueError:
+                wait_for_conch = False
+    if isinstance(hold_conch, str):
+        hold_conch = hold_conch.lower() in ('true', '1', 'yes', 'on')
+    # conch_hold_timeout (VM-1649): per-call override for THIS hold's idle-expiry
+    # TTL, in seconds. None ⇒ fall back to the configured CONCH_HOLD_EXPIRY
+    # default. A numeric string is coerced; a non-numeric/negative value is
+    # ignored (falls back to the default) so a typo never disables the safety
+    # valve. It is threaded into the Conch payload so other agents honour it.
+    resolved_hold_timeout: Optional[float] = None
+    if conch_hold_timeout is not None:
+        try:
+            parsed = float(conch_hold_timeout)
+            if parsed > 0:
+                resolved_hold_timeout = parsed
+        except (ValueError, TypeError):
+            logger.warning(
+                f"Invalid conch_hold_timeout value {conch_hold_timeout!r}; "
+                "using configured default"
+            )
     if isinstance(skip_conch, str):
         skip_conch = skip_conch.lower() in ('true', '1', 'yes', 'on')
+    # conch_mode (VM-1619) selects how a *queued* caller is served once
+    # wait_for_conch has engaged the queue. The arg overrides the
+    # VOICEMODE_CONCH_MODE config default (VM-1415); an unknown/empty value
+    # falls back to "wait" so a typo never silently downgrades a wait into a
+    # silent callback.
+    if conch_mode is None:
+        resolved_conch_mode = CONCH_MODE
+    else:
+        resolved_conch_mode = str(conch_mode).strip().lower()
+    if resolved_conch_mode not in ("wait", "callback"):
+        resolved_conch_mode = "wait"
+
+    # Resolve the session ID and project path once, for the conch payload.
+    # Precedence: explicit param > VOICEMODE_SESSION_ID > Claude Code's stdio
+    # env vars > absent. Env is only meaningful for stdio transport (a
+    # per-session child process); a shared serve/HTTP daemon simply won't have
+    # these set, so reading them is safe.
+    resolved_session_id = (
+        session_id
+        or os.environ.get("VOICEMODE_SESSION_ID")
+        or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or os.environ.get("CLAUDE_SESSION_ID")
+    )
+    try:
+        resolved_project_path = os.getcwd()
+    except OSError:
+        resolved_project_path = None
+    # The nominal voice this call will use (param, else the first configured
+    # default). Resolved cheaply here (no provider/network) so it can go in the
+    # conch for voice-clash avoidance (VM-914) — another agent can read the
+    # holder's voice and choose a different one.
+    resolved_voice = voice or (TTS_VOICES[0] if TTS_VOICES else None)
 
     # Resolve ref_text override once (path-vs-inline auto-detect). None means
     # "no override" — fall back to the resolved profile/sidecar transcript.
@@ -1497,7 +1618,13 @@ consult the MCP resources listed above.
     
     result = None
     success = False
-    conch = Conch(agent_name="converse")  # Named for event logging
+    conch = Conch(  # Named for event logging
+        agent_name="converse",
+        session_id=resolved_session_id,
+        project_path=resolved_project_path,
+        voice=resolved_voice,
+        hold_timeout=resolved_hold_timeout,  # VM-1649 per-call hold TTL override
+    )
 
     try:
         # Try to acquire conch atomically (no race condition)
@@ -1507,7 +1634,7 @@ consult the MCP resources listed above.
             acquired = conch.try_acquire()
 
             if not acquired:
-                # Another agent has the conch
+                # Another agent holds the conch (or a grant points elsewhere).
                 holder = Conch.get_holder()
                 holder_agent = holder.get('agent', 'unknown') if holder else 'unknown'
 
@@ -1516,24 +1643,89 @@ consult the MCP resources listed above.
                         "pid": os.getpid(),
                         "holder_pid": holder.get('pid') if holder else None,
                         "holder_agent": holder_agent,
-                        "wait_for_conch": wait_for_conch
+                        "wait_for_conch": wait_for_conch,
+                        "conch_mode": resolved_conch_mode,
                     })
 
                 if not wait_for_conch:
-                    # Default: return immediately with status info
-                    return (f"User is currently speaking with {holder_agent}. "
-                            "Use wait_for_conch=true to queue, or try again later.")
+                    # Gate closed (default): return IMMEDIATELY without queuing.
+                    # Mike's hard constraint — never silently block a caller who
+                    # did not opt in. Leave no registration behind. Tell them how
+                    # to engage the queue (and that a callback is an option).
+                    return (
+                        f"{holder_agent} currently holds the voice channel — your "
+                        f"message was NOT spoken, and you are NOT queued. Pass "
+                        f"wait_for_conch=true to join the queue: conch_mode=wait "
+                        f"blocks until your turn, conch_mode=callback returns "
+                        f"immediately with your position and delivers your turn "
+                        f"when granted. Or just try again later."
+                    )
 
-                # Wait mode - poll with atomic retry
+                # Gate open: become a first-class queue participant (visible in
+                # `voicemode conch status`) instead of blind-polling. A session
+                # id is required to be a tracked waiter — the queue and grant
+                # hint key on it — so fall back to a per-process id when the
+                # harness didn't supply one, pinning it on the conch so the grant
+                # machinery (grant-aware acquire + deregister-on-acquired) stays
+                # coherent through the wait.
+                if conch.session_id is None:
+                    conch.session_id = f"converse-{os.getpid()}"
+                queue_session_id = conch.session_id
+                try:
+                    position = ConchQueue.register(
+                        queue_session_id,
+                        agent="converse",
+                        project_path=resolved_project_path,
+                        voice=resolved_voice,
+                        mode=resolved_conch_mode,
+                        pid=os.getpid(),
+                    )
+                except Exception as e:
+                    # The queue must never break the critical-path lock. If
+                    # registration fails, fall back to legacy poll-and-block.
+                    logger.warning(f"Conch queue register failed ({e}); polling without a queue entry")
+                    position = None
+
+                if resolved_conch_mode == "callback":
+                    # Do NOT block. Return immediately with the position and stay
+                    # registered, so the turn can be delivered out-of-band when
+                    # granted: on a holder's release, grant_next pings a skipped
+                    # callback waiter via conch_notify.notify_granted (a session
+                    # nudge). Make crystal clear the message was not spoken and
+                    # how the turn resumes.
+                    if event_logger:
+                        event_logger.log_event("CONCH_CALLBACK_REGISTERED", {
+                            "pid": os.getpid(),
+                            "session_id": queue_session_id,
+                            "position": position,
+                            "holder_agent": holder_agent,
+                        })
+                    where = f"position #{position}" if position else "the queue"
+                    return (
+                        f"Queued for a callback at {where} — your message was NOT "
+                        f"spoken ({holder_agent} holds the voice channel). Your turn "
+                        f"will be actively delivered when the conch is granted to "
+                        f"you: a session nudge prompts you to call converse() and "
+                        f"take the floor (requires a session id). `voicemode conch "
+                        f"status` shows your place in line any time as a "
+                        f"supplementary view."
+                    )
+
+                # WAIT mode — block until granted, bounded by the timeout. Now
+                # that we are registered, try_acquire() is grant-aware: only the
+                # granted head acquires when the floor frees (FIFO; no steal),
+                # and it consumes the grant + deregisters us on success. It also
+                # fast-fails a dead holder and waits through a live hold.
                 if event_logger:
                     event_logger.log_event("CONCH_WAIT_START", {
                         "pid": os.getpid(),
                         "holder_agent": holder_agent,
-                        "timeout": CONCH_TIMEOUT
+                        "timeout": conch_wait_timeout,
+                        "position": position,
                     })
 
                 waited = 0.0
-                while not conch.try_acquire() and waited < CONCH_TIMEOUT:
+                while not conch.try_acquire() and waited < conch_wait_timeout:
                     await asyncio.sleep(CONCH_CHECK_INTERVAL)
                     waited += CONCH_CHECK_INTERVAL
 
@@ -1545,7 +1737,17 @@ consult the MCP resources listed above.
                     })
 
                 if not conch._acquired:
-                    return f"Timed out waiting for conch ({CONCH_TIMEOUT}s). {holder_agent} is still speaking."
+                    # Timed out — deregister cleanly so we leave no wedged entry
+                    # in the queue (a stale head would block promotion of others).
+                    try:
+                        ConchQueue.deregister(queue_session_id)
+                    except Exception:
+                        pass
+                    return (
+                        f"Timed out waiting for conch ({conch_wait_timeout:.0f}s). "
+                        f"{holder_agent} is still speaking. You can request a "
+                        f"callback instead with conch_mode=callback."
+                    )
 
             # Successfully acquired
             if event_logger:
@@ -2260,13 +2462,16 @@ consult the MCP resources listed above.
         return result
 
     finally:
-        # Release the conch to signal voice conversation has ended
+        # Release the conch to signal voice conversation has ended. With
+        # hold_conch=true, keep the floor between turns (re-stamped hold,
+        # flock dropped, file left) instead of a full release.
         if CONCH_ENABLED and conch._acquired:
-            held_seconds = conch.release()
+            held_seconds = conch.release(hold=hold_conch)
             if event_logger:
                 event_logger.log_event("CONCH_RELEASE", {
                     "pid": os.getpid(),
-                    "held_seconds": held_seconds
+                    "held_seconds": held_seconds,
+                    "hold_active": bool(hold_conch)
                 })
         else:
             # Don't call release() when not acquired — it would delete the lock
@@ -2296,6 +2501,94 @@ consult the MCP resources listed above.
             # Force garbage collection
             collected = gc.collect()
             logger.debug(f"Garbage collected {collected} objects")
+
+
+@mcp.tool()
+async def pause_conversation(
+    seconds: float,
+    message: Optional[str] = None,
+) -> str:
+    """Pause the conversation for a duration while KEEPING the floor (conch hold).
+
+    Use when you want to step away from the mic to do background work and then
+    resume speaking without another agent slipping in. Queued agents
+    (wait_for_conch) keep waiting for the duration; your turn is preserved.
+
+    The hold is re-stamped throughout the pause so it never idle-expires, and is
+    left in place when the pause ends — you reclaim it on your next converse
+    call. If you never return, the idle-expiry safety valve clears it.
+
+    Args:
+        seconds: How long to pause, in seconds.
+        message: Optional note shown in the tool-call display while pausing.
+                 Tip: pre-compute the resume time, e.g. "Resuming at 22:09:45".
+
+    Returns:
+        A message indicating the pause completed and the floor is still held.
+    """
+    end_str = datetime.fromtimestamp(time.time() + seconds).strftime("%H:%M:%S")
+
+    if not CONCH_ENABLED:
+        logger.info(f"pause_conversation: conch disabled; sleeping {seconds:.0f}s")
+        await asyncio.sleep(max(0.0, seconds))
+        return f"Pause complete (conch disabled). Resumed at {end_str}."
+
+    # Refuse to pause if another LIVE agent currently holds the floor — we must
+    # not clobber its payload (write_hold takes no flock).
+    holder = Conch.get_holder()
+    if holder:
+        holder_pid = holder.get("pid")
+        if holder_pid not in (None, os.getpid()):
+            try:
+                os.kill(holder_pid, 0)
+                return (f"Cannot pause: {holder.get('agent', 'another agent')} "
+                        f"(pid {holder_pid}) currently holds the conch.")
+            except (ProcessLookupError, PermissionError, TypeError, OSError):
+                pass  # holder dead/unknown — safe to take the floor
+
+    resolved_session_id = (
+        os.environ.get("VOICEMODE_SESSION_ID")
+        or os.environ.get("CLAUDE_CODE_SESSION_ID")
+        or os.environ.get("CLAUDE_SESSION_ID")
+    )
+    try:
+        project_path = os.getcwd()
+    except OSError:
+        project_path = None
+    # Preserve the voice already recorded by our own prior converse hold (if
+    # any) so a pause doesn't blank it out.
+    holder_voice = holder.get("voice") if holder else None
+
+    logger.info(
+        f"pause_conversation: holding for {seconds:.0f}s, resuming at {end_str}"
+        + (f" — {message}" if message else "")
+    )
+
+    # Re-stamp well within the hold TTL so a maintained pause never lapses.
+    # The TTL is now short (~10s, VM-1649), so the old fixed 10s interval would
+    # leave no headroom; re-stamp at most every half-TTL (min 1s). When idle-
+    # expiry is disabled (ttl <= 0) the hold never lapses, so the original 10s
+    # cadence is fine.
+    hold_ttl = _get_hold_expiry()
+    interval = max(1.0, min(10.0, hold_ttl / 2)) if hold_ttl > 0 else 10.0
+    elapsed = 0.0
+    while elapsed < seconds:
+        # Re-stamp the hold each chunk so a long pause never idle-expires.
+        Conch.write_hold(
+            "pause_conversation",
+            session_id=resolved_session_id,
+            project_path=project_path,
+            voice=holder_voice,
+            hold_timeout=hold_ttl if hold_ttl > 0 else None,
+        )
+        chunk = min(interval, seconds - elapsed)
+        await asyncio.sleep(chunk)
+        elapsed += chunk
+
+    return (
+        f"Pause complete. Resumed at {end_str} (after {seconds:.0f}s). "
+        "Floor still held — speak to continue, or it will idle-expire."
+    )
 
 
 

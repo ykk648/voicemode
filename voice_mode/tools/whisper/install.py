@@ -346,6 +346,25 @@ async def whisper_install(
         # Check for and migrate old installations
         migration_msg = auto_migrate_if_needed("whisper")
 
+        # NixOS cannot build whisper.cpp through the standard FHS path —
+        # cmake/gcc/CUDA expect paths like /usr/local/cuda/ and /usr/include/
+        # that don't exist on NixOS.  The VoiceMode flake.nix provides Nix-
+        # native packages instead.
+        if os.path.isfile("/etc/NIXOS"):
+            return {
+                "success": False,
+                "error": "NixOS detected — the standard whisper installer cannot "
+                         "build on NixOS because it expects FHS paths that don't exist.",
+                "nixos_guidance": {
+                    "cpu": "nix build github:mbailey/voicemode#whisper-cpp",
+                    "cuda": "nix build github:mbailey/voicemode#whisper-cpp-cuda",
+                    "wrapper": "nix build github:mbailey/voicemode#voice-mode-cuda",
+                    "note": "The voice-mode-cuda wrapper puts whisper-server on PATH "
+                            "so VoiceMode discovers it automatically. See flake.nix "
+                            "for GPU architecture options (cudaArch)."
+                }
+            }
+
         # Check whisper build dependencies (unless skipped)
         if not skip_deps:
             from voice_mode.utils.dependencies.checker import (
@@ -507,7 +526,16 @@ async def whisper_install(
                 missing_deps.append("build-essential (run: sudo apt-get install build-essential)")
             
             if use_gpu and not shutil.which("nvcc"):
-                missing_deps.append("CUDA toolkit (for GPU support)")
+                # Suggest distro-appropriate install command, or --no-gpu as alternative
+                if shutil.which("apt-get"):
+                    cuda_install = "sudo apt-get install nvidia-cuda-toolkit"
+                elif shutil.which("dnf"):
+                    cuda_install = "sudo dnf install cuda-toolkit"
+                else:
+                    cuda_install = "your distribution's CUDA toolkit package"
+                missing_deps.append(
+                    f"CUDA toolkit (run: {cuda_install}, or use --no-gpu for CPU-only)"
+                )
         
         if missing_deps:
             return {
